@@ -1,0 +1,95 @@
+import pandas as pd
+import numpy as np
+
+#读取数据
+# 读取主要纵向文件（含出生年月、教育、省份等）
+# 路径换成下载后存放的文件夹
+master = pd.read_stata('master_constructs.dta', convert_categoricals=False)
+
+# 读取收入文件
+income = pd.read_stata('income_public.dta', convert_categoricals=False)
+
+# 按个体ID和wave合并（保留有收入的记录）
+df = pd.merge(master, income, on=['IDind', 'wave'], how='inner')
+print(f"合并后样本量: {len(df)}")
+
+# 提取核心变量，并重命名
+df_clean = df[['IDind', 'wave', 'birthyear', 'birthmonth', 'a12', 'c8', 'gender', 't1']].copy()
+df_clean.columns = ['id', 'wave', 'birthyr', 'birthmo', 'educ', 'income', 'male', 'prov']
+
+# 将月份转为数值，缺失则填6月作为近似
+df_clean['birthmo'] = pd.to_numeric(df_clean['birthmo'], errors='coerce').fillna(6)
+
+# 生成出生年月距离断点的月数：驱动变量 X
+# 断点设置需要根据文献确定，假设为1971年9月（即1986年时未满15岁）
+cutoff_year, cutoff_month = 1971, 9
+df_clean['X'] = (df_clean['birthyr'] - cutoff_year) * 12 + (df_clean['birthmo'] - cutoff_month)
+
+# 性别变量：male=1为男性
+df_clean['male'] = np.where(df_clean['male'] == 1, 1, 0)  # 可能需要调整编码
+
+# 筛选关键变量非缺失，并排除极值
+df_clean = df_clean.dropna(subset=['educ', 'income', 'X'])
+df_clean = df_clean[(df_clean['income'] > 0) & (df_clean['educ'] > 0)]
+
+# 选择2011年wave（wave代码通常为年份，如2011）中的受访者，并且出生在1960-1980年之间
+wave_target = 2011
+df_rdd = df_clean[(df_clean['wave'] == wave_target) & 
+                  (df_clean['birthyr'].between(1960, 1980))].copy()
+
+# 驱动变量X限定在某个带宽内，如[-60, 60]个月
+df_rdd = df_rdd[df_rdd['X'].between(-60, 60)]
+
+print(f"可用于RDD的样本量: {len(df_rdd)}")
+# 保存为CSV，供接下来的分析代码调用
+df_rdd.to_csv('chns_rdd_sample.csv', index=False)
+
+df = pd.read_csv('chns_rdd_sample.csv)
+
+#绘制断点图
+# 分箱平均值图
+bins = pd.cut(df['X'], bins=40)
+mean_Y = df.groupby(bins)['Y'].mean()
+midpoints = [interval.mid for interval in mean_Y.index]
+
+plt.figure(figsize=(8,5))
+sns.scatterplot(x='X', y='Y', data=df.sample(200), alpha=0.3, color='grey')
+plt.plot(midpoints, mean_Y.values, 'o-', color='steelblue', markersize=5, label='Binned Mean')
+plt.axvline(x=0, color='red', linestyle='--', label='Cutoff')
+plt.xlabel('Distance to Cutoff (months)')
+plt.ylabel('Log Income')
+plt.title('RDD: Outcome by Forcing Variable')
+plt.legend()
+plt.show()
+
+#参数RDD估计
+# 添加交互项，使得断点两侧可以有不同斜率
+df['X_T'] = df['X'] * df['T']
+model = smf.ols('Y ~ T + X + X_T + I(X**2) + I(X**2)*T', data=df).fit()
+print(model.summary().tables[1])
+
+# 提取处理效应（T的系数）
+print(f"\n估计的教育回报率（对数点）: {model.params['T']:.4f}")
+print(f"即多受一年教育收入增加约 {model.params['T']*100:.2f}%")
+
+#非参数RDD（为使结果更严谨使用了专业库rdrobust
+from rdrobust import rdrobust
+
+# rdrobust自动选择最优带宽并进行推断
+rd_result = rdrobust(y=df['Y'], x=df['X'], c=0)
+print(rd_result)
+
+# 可视化结果
+rdrobust_plot = rdrobust(y=df['Y'], x=df['X'], c=0, p=1, kernel='triangular')
+
+#稳健性检验
+df['T_placebo'] = (df['X'] >= 20).astype(int)
+model_placebo = smf.ols('Y ~ T_placebo + X + X:T_placebo', data=df).fit()
+print(f"安慰剂检验（断点=+20）处理效应系数: {model_placebo.params['T_placebo']:.4f}, p值: {model_placebo.pvalues['T_placebo']:.4f}")
+
+# 简单可视化直方图
+plt.figure(figsize=(7,4))
+plt.hist(df['X'], bins=50, color='grey', edgecolor='white')
+plt.axvline(0, color='red', linestyle='--')
+plt.title('Histogram of Forcing Variable (McCrary Test)')
+plt.show()
